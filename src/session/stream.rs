@@ -1,0 +1,162 @@
+use std::collections::BTreeMap;
+use bytes::{Bytes, BytesMut};
+use crate::error::ApexError;
+
+pub type StreamId = u32;
+
+/// State of a single reliable ordered byte stream.
+/// Stream priority: 0 = highest (urgent/control), 7 = lowest (bulk background).
+pub type Priority = u8;
+pub const PRIORITY_HIGH: Priority = 0;
+pub const PRIORITY_DEFAULT: Priority = 4;
+pub const PRIORITY_LOW: Priority = 7;
+
+pub struct Stream {
+    pub id: StreamId,
+    /// Lower value = higher priority. Drives flush scheduling order.
+    pub priority: Priority,
+    // Send side
+    send_buf: BytesMut,
+    send_offset: u64,         // next byte offset to write into the wire
+    send_unacked_offset: u64, // oldest byte not yet ACKed
+    // Receive side
+    recv_offset: u64,         // next expected byte offset
+    recv_buf: BTreeMap<u64, Bytes>, // out-of-order segments keyed by offset
+    fin_received: Option<u64>,
+    fin_sent: bool,
+}
+
+impl Stream {
+    pub fn new(id: StreamId) -> Self {
+        Self {
+            id,
+            priority: PRIORITY_DEFAULT,
+            send_buf: BytesMut::new(),
+            send_offset: 0,
+            send_unacked_offset: 0,
+            recv_offset: 0,
+            recv_buf: BTreeMap::new(),
+            fin_received: None,
+            fin_sent: false,
+        }
+    }
+
+    // ── Send side ────────────────────────────────────────────────────────────
+
+    /// Buffer data to send. Returns the offset at which this data starts.
+    pub fn write(&mut self, data: &[u8]) -> Result<u64, ApexError> {
+        if self.fin_sent {
+            return Err(ApexError::StreamFinished(self.id));
+        }
+        let offset = self.send_offset;
+        self.send_buf.extend_from_slice(data);
+        self.send_offset += data.len() as u64;
+        Ok(offset)
+    }
+
+    /// Mark the stream as finished on the send side.
+    pub fn finish(&mut self) {
+        self.fin_sent = true;
+    }
+
+    /// Pop up to `max_bytes` of unsent data for packetisation.
+    /// Returns (offset, data).
+    pub fn poll_send(&mut self, max_bytes: usize) -> Option<(u64, Bytes)> {
+        if self.send_buf.is_empty() {
+            return None;
+        }
+        let take = self.send_buf.len().min(max_bytes);
+        let data = self.send_buf.split_to(take).freeze();
+        let offset = self.send_unacked_offset;
+        // Note: send_unacked_offset advances only on ACK; send_offset advances on write.
+        // For ARQ we track in-flight separately. Here we just report the slice.
+        Some((offset, data))
+    }
+
+    /// Called when the remote ACKs bytes up to `acked_offset` (exclusive).
+    pub fn on_ack(&mut self, acked_offset: u64) {
+        if acked_offset > self.send_unacked_offset {
+            self.send_unacked_offset = acked_offset;
+        }
+    }
+
+    // ── Receive side ─────────────────────────────────────────────────────────
+
+    /// Deliver an incoming segment. Buffers out-of-order segments.
+    pub fn receive(&mut self, offset: u64, data: Bytes, is_fin: bool) -> Result<(), ApexError> {
+        if is_fin {
+            self.fin_received = Some(offset + data.len() as u64);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Drop already-consumed data
+        if offset + data.len() as u64 <= self.recv_offset {
+            return Ok(());
+        }
+        self.recv_buf.insert(offset, data);
+        Ok(())
+    }
+
+    /// Read up to `max_bytes` of contiguous in-order data into `out`.
+    /// Returns bytes read.
+    pub fn read(&mut self, out: &mut Vec<u8>, max_bytes: usize) -> usize {
+        let mut read = 0;
+        while read < max_bytes {
+            let Some((&offset, _)) = self.recv_buf.iter().next() else { break };
+            if offset > self.recv_offset {
+                // Gap — waiting for earlier segment
+                break;
+            }
+            let data = self.recv_buf.remove(&offset).unwrap();
+            let skip = (self.recv_offset - offset) as usize;
+            let slice = &data[skip..];
+            let take = slice.len().min(max_bytes - read);
+            out.extend_from_slice(&slice[..take]);
+            self.recv_offset += take as u64;
+            read += take;
+        }
+        read
+    }
+
+    pub fn is_recv_finished(&self) -> bool {
+        self.fin_received.map_or(false, |fin_off| self.recv_offset >= fin_off)
+    }
+
+    pub fn is_send_finished(&self) -> bool {
+        self.fin_sent && self.send_unacked_offset >= self.send_offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_in_order() {
+        let mut s = Stream::new(1);
+        s.write(b"hello world").unwrap();
+        let (off, data) = s.poll_send(64).unwrap();
+        assert_eq!(off, 0);
+        s.receive(0, data, false).unwrap();
+        let mut out = Vec::new();
+        let n = s.read(&mut out, 64);
+        assert_eq!(n, 11);
+        assert_eq!(&out, b"hello world");
+    }
+
+    #[test]
+    fn test_stream_out_of_order() {
+        let mut s = Stream::new(2);
+        // Deliver second segment before first
+        s.receive(5, Bytes::from_static(b" world"), false).unwrap();
+        let mut out = Vec::new();
+        // Nothing readable yet
+        assert_eq!(s.read(&mut out, 64), 0);
+        // Deliver first segment
+        s.receive(0, Bytes::from_static(b"hello"), false).unwrap();
+        let n = s.read(&mut out, 64);
+        assert_eq!(n, 11);
+        assert_eq!(&out, b"hello world");
+    }
+}

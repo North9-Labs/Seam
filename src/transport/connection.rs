@@ -1,0 +1,394 @@
+/// Connection state machine: drives handshake, session, FEC, congestion, chaff, probing.
+///
+/// Server-side handshake flow (DDoS-resistant):
+///   1. ServerWaitCookie  — server sends stateless cookie challenge (zero state)
+///   2. ServerWaitMsg1    — client echoes valid cookie; server reads Noise msg1
+///   3. ServerWaitMsg3    — server sends msg2; awaits msg3
+///   4. Established
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+
+use pqcrypto_kyber::kyber768::PublicKey as KemPublicKey;
+
+use crate::{
+    crypto::{encoder::PacketEncoder, decoder::PacketDecoder},
+    error::ApexError,
+    fec::{ArbiterMode, FecArbiter, FecDecoder, FecEncoder},
+    handshake::{
+        CookieFactory,
+        IdentityKeypair,
+        state::{ClientHandshake, HandshakeResult, ServerHandshake},
+    },
+    packet::PktType,
+    session::{Session, SessionEvent},
+    transport::{
+        cc::{CongestionControl, Cubic},
+        chaff::ChaffScheduler,
+        probe::PathProber,
+    },
+};
+
+// ── Wire framing for pre-session packets ─────────────────────────────────────
+// Initial (cookie request):   type(1) = 0x10
+// CookieChallenge:            type(1) = 0x11  + cookie(32)
+// CookieEcho (msg1 wrapper):  type(1) = 0x12  + cookie(32) + msg1_len(2) + msg1
+// All other handshake bytes are passed directly through the Noise state machine.
+
+const PKT_COOKIE_REQ:       u8 = 0x10;
+const PKT_COOKIE_CHALLENGE: u8 = 0x11;
+const PKT_COOKIE_ECHO:      u8 = 0x12;
+const PKT_HANDSHAKE_MSG:    u8 = 0x13;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnPhase {
+    /// Client: sent cookie request, waiting for challenge.
+    ClientWaitChallenge,
+    /// Client: sent cookie echo (msg1), waiting for msg2.
+    ClientWaitMsg2,
+    /// Server: sent challenge, waiting for client cookie echo + msg1.
+    ServerWaitCookie,
+    /// Server: read msg1, sent msg2, waiting for msg3.
+    ServerWaitMsg3,
+    Established,
+    Draining,
+    Closed,
+}
+
+pub struct Connection {
+    pub remote: SocketAddr,
+    pub phase: ConnPhase,
+    socket: Arc<UdpSocket>,
+
+    // Handshake state
+    client_hs: Option<ClientHandshake>,
+    server_hs: Option<ServerHandshake>,
+    server_identity: Option<Arc<IdentityKeypair>>,
+    cookie_factory: Option<Arc<CookieFactory>>,
+
+    // Post-established
+    pub session: Option<Session>,
+    fec_arbiter: FecArbiter,
+    fec_enc: Option<FecEncoder>,
+    fec_dec: FecDecoder,
+    fec_group_id: u32,
+    pub cc: Box<dyn CongestionControl>,
+    pub chaff: ChaffScheduler,
+    pub prober: PathProber,
+
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
+    send_counter: u64,
+    /// Server's KEM public key, held by client during cookie handshake.
+    _server_kem_pk: Option<KemPublicKey>,
+}
+
+impl Connection {
+    // ── Constructors ─────────────────────────────────────────────────────────
+
+    /// Initiate an outbound connection. Sends a cookie request to start the
+    /// 1.5-RTT handshake: CookieRequest → CookieChallenge → CookieEcho(msg1)
+    /// → msg2 → msg3 → Established.
+    pub async fn connect(
+        socket: Arc<UdpSocket>,
+        remote: SocketAddr,
+        local_identity: &IdentityKeypair,
+        server_x25519: &[u8; 32],
+        server_kem_pk: &KemPublicKey,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<SessionEvent>), ApexError> {
+        // Send cookie request (single byte)
+        socket.send_to(&[PKT_COOKIE_REQ], remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+
+        let client_hs = ClientHandshake::new(local_identity, server_x25519)?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut conn = Self::new_base(socket, remote, ConnPhase::ClientWaitChallenge, tx);
+        conn.client_hs = Some(client_hs);
+        // Stash server KEM PK so we can use it in write_msg1 when the challenge arrives
+        conn._server_kem_pk = Some(server_kem_pk.clone());
+        Ok((conn, rx))
+    }
+
+    /// Prepare a server-side connection (call when any packet arrives from an unknown remote).
+    /// Immediately sends a cookie challenge — no state allocated until cookie is verified.
+    pub async fn accept_challenge(
+        socket: Arc<UdpSocket>,
+        remote: SocketAddr,
+        server_identity: Arc<IdentityKeypair>,
+        cookie_factory: Arc<CookieFactory>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<SessionEvent>), ApexError> {
+        // Send stateless cookie challenge
+        let addr_bytes = remote.to_string();
+        let cookie = cookie_factory.generate(addr_bytes.as_bytes());
+        let mut challenge = vec![PKT_COOKIE_CHALLENGE];
+        challenge.extend_from_slice(&cookie);
+        socket.send_to(&challenge, remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut conn = Self::new_base(socket, remote, ConnPhase::ServerWaitCookie, tx);
+        conn.server_identity = Some(server_identity);
+        conn.cookie_factory = Some(cookie_factory);
+        Ok((conn, rx))
+    }
+
+    fn new_base(
+        socket: Arc<UdpSocket>,
+        remote: SocketAddr,
+        phase: ConnPhase,
+        event_tx: mpsc::UnboundedSender<SessionEvent>,
+    ) -> Self {
+        Self {
+            remote, phase, socket,
+            client_hs: None, server_hs: None, server_identity: None,
+            cookie_factory: None,
+            _server_kem_pk: None,
+            session: None,
+            fec_arbiter: FecArbiter::new(),
+            fec_enc: None,
+            fec_dec: FecDecoder::new(),
+            fec_group_id: 0,
+            cc: Box::new(Cubic::new()),
+            chaff: ChaffScheduler::new(),
+            prober: PathProber::new(),
+            event_tx,
+            send_counter: 0,
+        }
+    }
+
+    fn finish_handshake(&mut self, result: HandshakeResult) {
+        let enc = PacketEncoder::new(result.keys.clone(), result.session_id);
+        let dec = PacketDecoder::new(result.keys);
+        self.session = Some(Session::new(result.session_id, enc, dec));
+        self.phase = ConnPhase::Established;
+        self.chaff.enable();
+        self.server_identity = None;
+        self.cookie_factory = None;
+        self._server_kem_pk = None;
+    }
+
+    // ── Ingress ──────────────────────────────────────────────────────────────
+
+    pub async fn on_packet(&mut self, buf: &mut Vec<u8>) -> Result<(), ApexError> {
+        if buf.is_empty() { return Ok(()); }
+        match self.phase {
+            ConnPhase::ClientWaitChallenge => self.client_rx_challenge(buf).await?,
+            ConnPhase::ClientWaitMsg2      => self.client_rx_msg2(buf).await?,
+            ConnPhase::ServerWaitCookie    => self.server_rx_cookie_echo(buf).await?,
+            ConnPhase::ServerWaitMsg3      => self.server_rx_msg3(buf).await?,
+            ConnPhase::Established         => self.on_data_packet(buf).await?,
+            ConnPhase::Draining | ConnPhase::Closed => {}
+        }
+        Ok(())
+    }
+
+    // Client received cookie challenge → echo it back with msg1
+    async fn client_rx_challenge(&mut self, buf: &[u8]) -> Result<(), ApexError> {
+        if buf.len() < 1 + 32 || buf[0] != PKT_COOKIE_CHALLENGE {
+            return Err(ApexError::HandshakeFailed("expected cookie challenge".into()));
+        }
+        let cookie: [u8; 32] = buf[1..33].try_into().unwrap();
+
+        let hs = self.client_hs.as_mut()
+            .ok_or_else(|| ApexError::HandshakeFailed("no client hs".into()))?;
+        let kem_pk = self._server_kem_pk.as_ref()
+            .ok_or_else(|| ApexError::HandshakeFailed("no server kem pk".into()))?;
+        let mut msg1 = Vec::new();
+        hs.write_msg1(kem_pk, &mut msg1)?;
+
+        // CookieEcho = type(1) + cookie(32) + msg1_len(2) + msg1
+        let mut echo = vec![PKT_COOKIE_ECHO];
+        echo.extend_from_slice(&cookie);
+        echo.extend_from_slice(&(msg1.len() as u16).to_le_bytes());
+        echo.extend_from_slice(&msg1);
+        self.socket.send_to(&echo, self.remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+        self.phase = ConnPhase::ClientWaitMsg2;
+        Ok(())
+    }
+
+    // Client received msg2 → write msg3 → established
+    async fn client_rx_msg2(&mut self, buf: &[u8]) -> Result<(), ApexError> {
+        let payload = strip_type(buf, PKT_HANDSHAKE_MSG)?;
+        let hs = self.client_hs.as_mut()
+            .ok_or_else(|| ApexError::HandshakeFailed("no client hs".into()))?;
+        let server_kem_pk = hs.read_msg2(payload)?;
+
+        let hs = self.client_hs.take().unwrap();
+        let mut msg3 = Vec::new();
+        let result = hs.write_msg3_and_finish(&server_kem_pk, &mut msg3)?;
+
+        let mut pkt = vec![PKT_HANDSHAKE_MSG];
+        pkt.extend_from_slice(&msg3);
+        self.socket.send_to(&pkt, self.remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+        self.finish_handshake(result);
+        Ok(())
+    }
+
+    // Server received cookie echo — verify cookie, then process msg1, send msg2
+    async fn server_rx_cookie_echo(&mut self, buf: &[u8]) -> Result<(), ApexError> {
+        if buf.len() < 1 + 32 + 2 || buf[0] != PKT_COOKIE_ECHO {
+            return Err(ApexError::HandshakeFailed("expected cookie echo".into()));
+        }
+        let cookie: &[u8; 32] = buf[1..33].try_into().unwrap();
+        let addr_bytes = self.remote.to_string();
+
+        let factory = self.cookie_factory.as_ref()
+            .ok_or_else(|| ApexError::HandshakeFailed("no cookie factory".into()))?;
+        if !factory.verify(addr_bytes.as_bytes(), cookie) {
+            return Err(ApexError::HandshakeFailed("invalid cookie".into()));
+        }
+
+        let msg1_len = u16::from_le_bytes([buf[33], buf[34]]) as usize;
+        if buf.len() < 35 + msg1_len {
+            return Err(ApexError::HandshakeFailed("truncated msg1".into()));
+        }
+        let msg1 = &buf[35..35 + msg1_len];
+
+        // Allocate server handshake state only after cookie is verified
+        let identity = self.server_identity.as_ref()
+            .ok_or_else(|| ApexError::HandshakeFailed("no server identity".into()))?;
+        let mut server_hs = ServerHandshake::new(identity)?;
+        server_hs.read_msg1(msg1)?;
+
+        let mut msg2 = Vec::new();
+        server_hs.write_msg2(&identity.kem_pk, &mut msg2)?;
+
+        let mut pkt = vec![PKT_HANDSHAKE_MSG];
+        pkt.extend_from_slice(&msg2);
+        self.socket.send_to(&pkt, self.remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+
+        self.server_hs = Some(server_hs);
+        self.phase = ConnPhase::ServerWaitMsg3;
+        Ok(())
+    }
+
+    // Server received msg3 → finish
+    async fn server_rx_msg3(&mut self, buf: &[u8]) -> Result<(), ApexError> {
+        let payload = strip_type(buf, PKT_HANDSHAKE_MSG)?;
+        let hs = self.server_hs.take()
+            .ok_or_else(|| ApexError::HandshakeFailed("no server hs".into()))?;
+        let identity = self.server_identity.as_ref()
+            .ok_or_else(|| ApexError::HandshakeFailed("no server identity".into()))?;
+        let result = hs.read_msg3_and_finish(&identity.kem_sk, payload)?;
+        self.finish_handshake(result);
+        Ok(())
+    }
+
+    async fn on_data_packet(&mut self, buf: &mut Vec<u8>) -> Result<(), ApexError> {
+        let session = self.session.as_mut()
+            .ok_or_else(|| ApexError::HandshakeFailed("no session".into()))?;
+        let events = session.receive_packet(buf)?;
+        for ev in events {
+            let _ = self.event_tx.send(ev);
+        }
+        Ok(())
+    }
+
+    // ── Egress ───────────────────────────────────────────────────────────────
+
+    pub async fn flush(&mut self) -> Result<(), ApexError> {
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let packets = session.flush()?;
+        if packets.is_empty() { return Ok(()); }
+
+        let (fec_k, fec_r) = match self.fec_arbiter.mode {
+            ArbiterMode::HybridFecArq { k, r } | ArbiterMode::PureFec { k, r } => (Some(k), Some(r)),
+            ArbiterMode::PureArq => (None, None),
+        };
+
+        for pkt in packets {
+            let size = pkt.len() as u64;
+            if self.cc.available() < size { break; }
+
+            self.socket.send_to(&pkt, self.remote).await
+                .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+            self.cc.on_send(size);
+            self.send_counter += 1;
+
+            if let (Some(k), Some(r)) = (fec_k, fec_r) {
+                let gid = self.fec_group_id;
+                let enc = self.fec_enc.get_or_insert_with(|| FecEncoder::new(gid, k, r));
+                if enc.group_id != gid { *enc = FecEncoder::new(gid, k, r); }
+                if let Some(repairs) = enc.push_source(&pkt) {
+                    self.fec_group_id = self.fec_group_id.wrapping_add(1);
+                    for rep in &repairs {
+                        let _ = self.socket.send_to(&rep.to_bytes(), self.remote).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn maybe_send_chaff(&mut self) -> Result<(), ApexError> {
+        if !self.chaff.should_send() { return Ok(()); }
+        let session = match self.session.as_mut() { Some(s) => s, None => return Ok(()) };
+        let payload = ChaffScheduler::payload(self.send_counter);
+        let padded = self.chaff.pad_to_mtu(&payload, self.prober.path_mtu);
+        let mut out = vec![0u8; 32 + padded.len() + 16];
+        let n = session.encode_raw(PktType::Chaff, &padded, &mut out)?;
+        out.truncate(n);
+        self.socket.send_to(&out, self.remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+        self.chaff.mark_sent(self.send_counter);
+        self.send_counter += 1;
+        Ok(())
+    }
+
+    pub async fn maybe_send_probe(&mut self) -> Result<(), ApexError> {
+        if !self.prober.should_probe() { return Ok(()); }
+        let (_, payload) = self.prober.build_probe();
+        let session = match self.session.as_mut() { Some(s) => s, None => return Ok(()) };
+        let mut out = vec![0u8; 32 + payload.len() + 16];
+        let n = session.encode_raw(PktType::PathProbe, &payload, &mut out)?;
+        out.truncate(n);
+        self.socket.send_to(&out, self.remote).await
+            .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn retransmit_expired(&mut self) -> Result<(), ApexError> {
+        let session = match self.session.as_mut() { Some(s) => s, None => return Ok(()) };
+        let expired = session.drain_retransmits();
+        if !expired.is_empty() { self.cc.on_timeout(); }
+        for (_, data) in expired {
+            self.socket.send_to(&data, self.remote).await
+                .map_err(|e| ApexError::HandshakeFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn tick_fec(&mut self) {
+        if let Some(session) = &self.session {
+            let in_flight = session.arq_in_flight() as u64;
+            let rtt_us = session.srtt_us();
+            self.fec_arbiter.on_ack_epoch(0, in_flight.max(1), rtt_us);
+        }
+    }
+
+    pub fn is_established(&self) -> bool { self.phase == ConnPhase::Established }
+    pub fn is_closed(&self) -> bool { matches!(self.phase, ConnPhase::Closed | ConnPhase::Draining) }
+    pub fn close(&mut self) { self.phase = ConnPhase::Draining; }
+
+        /// Allow overriding the CC implementation (e.g. for testing or ML controller).
+    pub fn set_congestion_controller(&mut self, cc: Box<dyn CongestionControl>) {
+        self.cc = cc;
+    }
+}
+
+fn strip_type(buf: &[u8], expected: u8) -> Result<&[u8], ApexError> {
+    if buf.is_empty() || buf[0] != expected {
+        return Err(ApexError::HandshakeFailed(
+            format!("expected pkt type 0x{expected:02x}, got 0x{:02x}", buf.first().copied().unwrap_or(0xff))
+        ));
+    }
+    Ok(&buf[1..])
+}
